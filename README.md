@@ -114,26 +114,65 @@ produced console lines rotated left by two characters.
 
 ## Build
 
-What you need:
+**This repository does not contain the kernel source.** It holds the three
+patches, the board DTS, the config fragment and the scripts; you supply a
+vanilla Linux 6.18.39 tree from kernel.org. `VERSION` pins the exact release.
 
-| | |
-|---|---|
-| Kernel source | a pristine Linux 6.18.39 tree with `kernel/patches/*` applied |
-| Kernel compiler | `arm-linux-gnueabihf-` (GCC 14.2.0 is the tested version) |
-| Userspace compiler | an armv7 hard-float musl toolchain |
-| `mkbootimg` | to build the Android v0 boot container |
+You need an ARM cross-toolchain (`arm-linux-gnueabihf-`; GCC 14.2.0 is what
+this is built and tested with) and `mkbootimg`.
+
+### 1. Fetch the kernel
+
+```sh
+./vm/fetch-sources.sh /path/to/work
+```
+
+Downloads and extracts `linux-6.18.39` (and the rtl8188eu tree, which is
+optional - mainline `rtl8xxxu` drives the Wi-Fi adapter). Or do it by hand:
+
+```sh
+curl -fLO https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.39.tar.xz
+tar -xf linux-6.18.39.tar.xz
+```
+
+### 2. Apply the patches
+
+```sh
+sh kernel/apply-patches.sh /path/to/work/src/linux-6.18.39
+```
+
+Applies `kernel/patches/*` in order. Safe to re-run - patches already present
+are detected and skipped rather than applied twice.
+
+### 3. Build
 
 ```sh
 JOBS=$(nproc) sh kernel/build-kernel.sh \
-  /path/to/linux-6.18.39 \
+  /path/to/work/src/linux-6.18.39 \
   /path/to/build-dir \
   arm-linux-gnueabihf-
+```
 
+This runs `allnoconfig`, merges `kernel/game-stick.fragment`, runs
+`olddefconfig`, copies the board DTS into the tree, and builds `zImage`,
+modules and the DTB. Outputs land in `<build-dir>/artifacts/` with a
+`SHA256SUMS`.
+
+### 4. Package for the vendor bootloader
+
+```sh
 sh scripts/make-android-boot.sh \
   /path/to/build-dir/artifacts/zImage \
   /path/to/build-dir/artifacts/sun8i-t113s-h133-game-stick.dtb \
   boot-new.img
 ```
+
+Produces the Android v0 container U-Boot expects, and refuses to emit anything
+larger than p4's 6,451,200 bytes.
+
+Steps 1-2 have been checked to reproduce the exact tree these images were built
+from: a clean kernel.org tarball plus the three patches is byte-identical to
+the development tree, apart from the DTS that step 3 copies in.
 
 `build-kernel.sh` runs `allnoconfig`, merges `kernel/game-stick.fragment`, then
 `olddefconfig`. Validate the result before flashing:
