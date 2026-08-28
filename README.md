@@ -68,16 +68,17 @@ contradicts itself in places; this file is the truth about the current build.
 | Status LED | PB12 |
 | UART0 | PB8/PB9 per vendor DT; **pads not located** |
 | Wi-Fi | RTL8188ETV, USB `0bda:0179` |
-| Boot media | removable SD card, GPT disk id `AB6F3888-569A-4926-9668-80941DCB40BC` |
+| Boot media | removable SD card |
 
-> **Always identify the card by GPT disk id, never by device name.** It has
-> enumerated as both `/dev/sdc` and `/dev/sdd` depending on what else is
-> plugged in. On the development host `/dev/sdb2` is the root filesystem and
-> must never be written.
+> **Identify the card by GPT disk id, never by device name.** Device names are
+> not stable across reboots or between readers, and writing a boot image to the
+> wrong disk destroys it. Record your card's id once:
 >
 > ```sh
-> lsblk -dno PATH,PTUUID | awk 'tolower($2)=="ab6f3888-569a-4926-9668-80941dcb40bc"{print $1}'
+> lsblk -dno PATH,PTUUID          # note the id for your card
 > ```
+>
+> and select by that id in any script that writes to it.
 
 ### Partition layout
 
@@ -113,29 +114,25 @@ produced console lines rotated left by two characters.
 
 ## Build
 
-Everything is built inside the Arch VM (`~/archvm.sh` on the host, then
-`ssh mcvm`).
+What you need:
 
 | | |
 |---|---|
-| Kernel source | `~/gamestick-shit/gamestick-mainline/src/linux-6.18.39` |
-| Build directory | `~/gcc14-test/build-hdmi` |
-| Project copy | `~/gcc14-test/{kernel,dts,scripts}` |
-| Kernel compiler | `arm-linux-gnueabihf-` (Debian GCC 14.2.0, via Bedrock) |
-| Userspace compiler | `~/armv7-toolchain` (crosstool-NG, armv7 musl) |
+| Kernel source | a pristine Linux 6.18.39 tree with `kernel/patches/*` applied |
+| Kernel compiler | `arm-linux-gnueabihf-` (GCC 14.2.0 is the tested version) |
+| Userspace compiler | an armv7 hard-float musl toolchain |
+| `mkbootimg` | to build the Android v0 boot container |
 
 ```sh
-# on the VM
-cd ~/gcc14-test
-JOBS=6 sh kernel/build-kernel.sh \
-  /home/user/gamestick-shit/gamestick-mainline/src/linux-6.18.39 \
-  /home/user/gcc14-test/build-hdmi \
+JOBS=$(nproc) sh kernel/build-kernel.sh \
+  /path/to/linux-6.18.39 \
+  /path/to/build-dir \
   arm-linux-gnueabihf-
 
 sh scripts/make-android-boot.sh \
-  build-hdmi/artifacts/zImage \
-  build-hdmi/artifacts/sun8i-t113s-h133-game-stick.dtb \
-  ~/gcc14-test/boot-new.img
+  /path/to/build-dir/artifacts/zImage \
+  /path/to/build-dir/artifacts/sun8i-t113s-h133-game-stick.dtb \
+  boot-new.img
 ```
 
 `build-kernel.sh` runs `allnoconfig`, merges `kernel/game-stick.fragment`, then
@@ -158,8 +155,8 @@ here is built and tested with.
 Only possible when the stick boots and reaches the network.
 
 ```sh
-scp -i ~/.ssh/gamestick_ed25519 boot-new.img user@gamestick:/tmp/
-ssh -i ~/.ssh/gamestick_ed25519 user@gamestick '
+scp boot-new.img user@<stick>:/tmp/
+ssh user@<stick> '
   doas dd if=/tmp/boot-new.img of=/dev/mmcblk0p4 bs=1M conv=fsync status=none
   doas sync
   sz=$(stat -c %s /tmp/boot-new.img)
@@ -176,7 +173,8 @@ this board - the micro-USB and USB-A ports do not enumerate for it - but the
 bootloader lives on a removable card, so the reader *is* the recovery path.
 
 ```sh
-dev=$(lsblk -dno PATH,PTUUID | awk 'tolower($2)=="ab6f3888-569a-4926-9668-80941dcb40bc"{print $1}')
+CARD_ID=<your card's GPT disk id>
+dev=$(lsblk -dno PATH,PTUUID | awk -v t="$CARD_ID" 'tolower($2)==tolower(t){print $1}')
 [ -n "$dev" ] || { echo "card not found"; exit 1; }
 sudo dd if=boot-new.img of="${dev}4" bs=1M conv=fsync status=none
 sudo sync
@@ -184,9 +182,8 @@ sudo sync
 
 Verify the readback hash, then `sudo udisksctl power-off -b "$dev"`.
 
-The USB-C reader in use is orientation-sensitive and only enumerates one way
-round. A write that fails partway (`Input/output error`) leaves p4 corrupt -
-just retry and re-verify.
+A write that fails partway (`Input/output error`) leaves p4 corrupt. Retry and
+re-verify; cheap card readers do this.
 
 ### Known-good images
 
@@ -525,16 +522,23 @@ silently returns NULL.
 | Hangs mid-boot with console text | note the last line, card reader |
 | Wedged after a change | power cycle; `reboot` may not survive |
 
-There is no FEL/USB recovery on this board. The bootloader is on the removable
-card, so the card reader is always the way back. Backups live in `backups/`:
+There is no FEL/USB recovery on this board - neither the micro-USB nor the
+USB-A port enumerates for it. The bootloader lives on the removable card, so
+the card reader is always the way back.
 
-- `gamestick-rootfs-20260826.tar.gz` - full p5 rootfs (831 M, 60,624 entries,
-  verified; **root-owned**)
-- `gamestick-bootarea-20260826.img.gz` - sectors 0-57119, the raw bootloader
-  region and p1-p4
-- `mmcblk0p4-live-pre-v53.img` - p4 before the DRM work
-- `v52-working-kernel-backup.tar.gz` - config, zImage, DTB, boot image, modules
-  and sources for the last pre-DRM build
+Take these before changing anything, because a bad p4 write or a PHY that
+brings up the display wrong will leave you with no console:
+
+| Backup | How |
+|---|---|
+| Raw boot area, sectors 0-57119 | `dd` the bootloader region and p1-p4 off the card |
+| Working boot image | copy p4 while it still boots |
+| Root filesystem | `tar` p5, as root, to preserve ownership |
+| Matching modules | `/lib/modules/<release>` - see the vermagic note above |
+
+Keep the last known-good boot image somewhere you can reach without the stick.
+Recovery is: put the card in a reader, write that image back to p4, verify the
+readback hash.
 
 ---
 
