@@ -1,0 +1,6 @@
+LABEL=rootfs	/	ext4	rw,noatime	0 1
+proc	/proc	proc	nosuid,nodev,noexec	0 0
+sysfs	/sys	sysfs	nosuid,nodev,noexec	0 0
+devpts	/dev/pts	devpts	gid=5,mode=620	0 0
+tmpfs	/run	tmpfs	nosuid,nodev,mode=0755	0 0
+tmpfs	/tmp	tmpfs	nosuid,nodev,mode=1777	0 0

@@ -1,0 +1,16 @@
+diff --git a/osdep_service_linux.h b/osdep_service_linux.h
+index ba25fc0..3f11271 100644
+--- a/osdep_service_linux.h
++++ b/osdep_service_linux.h
+@@ -43,6 +43,11 @@
+ #include <linux/interrupt.h>	/* for struct tasklet_struct */
+ #include <linux/ip.h>
+ #include <linux/kthread.h>
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
++#define from_timer(var, callback_timer, timer_fieldname) \
++	timer_container_of(var, callback_timer, timer_fieldname)
++#endif
+ #include <linux/list.h>
+ #include <linux/vmalloc.h>
+ 

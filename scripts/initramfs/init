@@ -1,0 +1,65 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Minimal early userspace for no-UART bring-up.  It deliberately does not rely
+# on a fixed mmcblk number: probing order is a kernel implementation detail.
+
+PATH=/bin
+export PATH
+
+led_off() {
+	[ -n "$led" ] || return 0
+	echo none > "$led/trigger" 2>/dev/null || true
+	echo 0 > "$led/brightness" 2>/dev/null || true
+}
+
+pulse() {
+	count=$1
+	[ -n "$led" ] || return 0
+	led_off
+	i=0
+	while [ "$i" -lt "$count" ]; do
+		echo 1 > "$led/brightness" 2>/dev/null || true
+		sleep 1
+		echo 0 > "$led/brightness" 2>/dev/null || true
+		sleep 1
+		i=$((i + 1))
+	done
+}
+
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mkdir -p /newroot
+
+led=
+for candidate in /sys/class/leds/*; do
+	[ -d "$candidate" ] || continue
+	led=$candidate
+	break
+done
+
+# One long pulse: initramfs is running.  Repeating two-pulse groups mean no
+# candidate root node exists; four-pulse groups mean one existed but ext4
+# rejected the mount.
+pulse 1
+while :; do
+	found=0
+	for root in /dev/mmcblk0p5 /dev/mmcblk1p5 /dev/mmcblk2p5; do
+		[ -b "$root" ] || continue
+		found=1
+		if mount -t ext4 -o rw "$root" /newroot 2>/dev/null; then
+			mkdir -p /newroot/var/log
+			printf '%s\n' "initramfs mounted $root and is starting Alpine" \
+				> /newroot/var/log/gamestick-initramfs.log
+			sync
+			exec switch_root /newroot /sbin/init
+		fi
+	done
+	if [ "$found" -eq 0 ]; then
+		pulse 2
+	else
+		pulse 4
+	fi
+	sleep 2
+done

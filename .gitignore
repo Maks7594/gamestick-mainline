@@ -1,0 +1,23 @@
+# Contains a full rootfs: SSH host private keys, dropbear host keys,
+# authorized_keys and /etc/wpa_supplicant/wpa_supplicant.conf with a live PSK.
+# Never publish.
+backups/
+
+# Build outputs. Mostly harmless kernel+DTB boot images, but
+# gamestick-mainline-60906m.img is a 63.8 GB sparse full-card image carrying the
+# same rootfs secrets as backups/, and the directory is ~500 MB regardless.
+artifacts/
+
+# Real credentials, as opposed to the .example next to it.
+rootfs/files/etc/wpa_supplicant/wpa_supplicant.conf
+*.pem
+*_ed25519
+*_rsa
+*_ecdsa
+authorized_keys
+
+*.o
+*.ko
+*.img
+*.tar.gz
+*.tgz

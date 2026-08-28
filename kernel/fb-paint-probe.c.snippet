@@ -1,0 +1,169 @@
+
+/*
+ * ---- Game Stick direct framebuffer console (DIAGNOSTIC) ----
+ *
+ * v42 put a green band on screen, so ioremap_wc(0x4bee8c00) now works and
+ * kernel code can write to the display reliably. But the screen was never
+ * cleared and Tux survived, so fbcon never took over.
+ *
+ * Rather than keep guessing why the VT/fbcon chain is silent, render text
+ * directly. This depends on nothing but the framebuffer and the built-in VGA
+ * 8x16 font: no simplefb, no VT, no fbcon, no console, no userspace.
+ *
+ * 1280x720 with an 8x16 font gives 160 columns x 45 rows.
+ *
+ * Two triggers, because the message that matters arrives *after* every initcall
+ * has run - prepare_namespace() panics with "here are the available
+ * partitions:" once kernel_init reaches it:
+ *
+ *   late_initcall   - render the boot log so far, proving the renderer works
+ *   kmsg_dumper     - re-render on panic/oops, capturing the VFS panic
+ *
+ * The framebuffer is mapped ONCE at late_initcall and the pointer kept, because
+ * ioremap() allocates and is not safe to call from panic context.
+ */
+#include <linux/io.h>
+#include <linux/font.h>
+#include <linux/kmsg_dump.h>
+#include <linux/workqueue.h>
+
+#define GS_FB_BASE   0x4bee8c00UL
+#define GS_FB_SIZE   0x384000UL
+#define GS_W         1280U
+#define GS_H         720U
+#define GS_COLS      (GS_W / 8)		/* 160 */
+#define GS_ROWS      (GS_H / 16)	/* 45  */
+#define GS_MAXROWS   1024
+
+static void __iomem *gs_fb __read_mostly;
+static const struct font_desc *gs_font __read_mostly;
+static char gs_logbuf[8192];
+static unsigned int gs_rowoff[GS_MAXROWS];
+
+static void gs_clear(u32 colour)
+{
+	unsigned int i;
+
+	for (i = 0; i < GS_W * GS_H; i++)
+		writel(colour, gs_fb + i * 4);
+}
+
+static void gs_draw_char(unsigned int col, unsigned int row, unsigned char ch,
+			 u32 fg, u32 bg)
+{
+	const u8 *glyph = (const u8 *)gs_font->data + ch * 16;
+	unsigned int y, x, px = col * 8, py = row * 16;
+
+	for (y = 0; y < 16; y++) {
+		u8 bits = glyph[y];
+
+		for (x = 0; x < 8; x++)
+			writel((bits & (0x80 >> x)) ? fg : bg,
+			       gs_fb + ((py + y) * GS_W + px + x) * 4);
+	}
+}
+
+/* Render the tail of the text so the newest lines are the ones kept. */
+static void gs_render(const char *s, size_t len)
+{
+	unsigned int rows = 0, col = 0, row, i, start;
+
+	if (!gs_fb || !gs_font)
+		return;
+
+	gs_rowoff[0] = 0;
+	for (i = 0; i < len && rows < GS_MAXROWS - 1; i++) {
+		if (s[i] == '\n' || col == GS_COLS) {
+			gs_rowoff[++rows] = (s[i] == '\n') ? i + 1 : i;
+			col = 0;
+			if (s[i] != '\n')
+				i--;
+			continue;
+		}
+		col++;
+	}
+
+	start = (rows > GS_ROWS) ? gs_rowoff[rows - GS_ROWS] : 0;
+
+	gs_clear(0x00000000);
+	col = 0;
+	row = 0;
+	for (i = start; i < len && row < GS_ROWS; i++) {
+		if (s[i] == '\n' || col == GS_COLS) {
+			row++;
+			col = 0;
+			if (s[i] == '\n')
+				continue;
+		}
+		if (row >= GS_ROWS)
+			break;
+		if ((unsigned char)s[i] >= 32)
+			gs_draw_char(col++, row, s[i], 0x00cccccc, 0x00000000);
+		else
+			col++;
+	}
+	wmb();
+}
+
+static void gs_dump_log(void)
+{
+	struct kmsg_dump_iter iter;
+	size_t len = 0;
+
+	kmsg_dump_rewind(&iter);
+	if (kmsg_dump_get_buffer(&iter, true, gs_logbuf, sizeof(gs_logbuf), &len))
+		gs_render(gs_logbuf, len);
+}
+
+static void gs_kmsg_dump(struct kmsg_dumper *dumper,
+			 struct kmsg_dump_detail *detail)
+{
+	gs_dump_log();
+}
+
+static struct kmsg_dumper gs_dumper = {
+	.dump = gs_kmsg_dump,
+	.max_reason = KMSG_DUMP_MAX,
+};
+
+/*
+ * Live refresh. late_initcall renders too early and the panic dumper never
+ * fires if the kernel simply stops without panicking - which is exactly what
+ * v43 did. Repainting once a second means the screen always shows the current
+ * tail of the log, so "where does it actually stop" is directly readable.
+ *
+ * Process context via a workqueue, not a timer: a full repaint is ~1M writel()s
+ * and has no business running in softirq context.
+ */
+static void gs_work_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(gs_work, gs_work_fn);
+
+static void gs_work_fn(struct work_struct *work)
+{
+	gs_dump_log();
+	schedule_delayed_work(&gs_work, HZ);
+}
+
+static int __init gamestick_fbcon_init(void)
+{
+	gs_fb = ioremap_wc(GS_FB_BASE, GS_FB_SIZE);
+	if (!gs_fb)
+		return 0;
+
+	gs_font = find_font("VGA8x16");
+	if (!gs_font) {
+		/* Font missing: leave a red bar so the failure is not silent. */
+		unsigned int i;
+
+		for (i = 0; i < 32 * GS_W; i++)
+			writel(0x00ff0000, gs_fb + i * 4);
+		wmb();
+		return 0;
+	}
+
+	kmsg_dump_register(&gs_dumper);
+	gs_dump_log();
+	schedule_delayed_work(&gs_work, HZ);
+	return 0;
+}
+late_initcall(gamestick_fbcon_init);

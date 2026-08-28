@@ -1,0 +1,48 @@
+ARM: psci: log the CPU_ON return value
+
+Downstream diagnostic only.
+---
+--- a/arch/arm/kernel/psci_smp.c	2026-08-23 23:01:17.243516941 +0200
++++ b/arch/arm/kernel/psci_smp.c	2026-08-23 23:01:17.293980902 +0200
+@@ -44,17 +44,33 @@
+ 
+ static int psci_boot_secondary(unsigned int cpu, struct task_struct *idle)
+ {
+-	if (psci_ops.cpu_on)
++	phys_addr_t entry;
++	int ret;
++
++	if (!psci_ops.cpu_on)
++		return -ENODEV;
++
+ #ifdef CONFIG_XIP_KERNEL
+-		return psci_ops.cpu_on(cpu_logical_map(cpu),
+-			((phys_addr_t)(&secondary_startup)
+-			- XIP_VIRT_ADDR(CONFIG_XIP_PHYS_ADDR)
+-			+ CONFIG_XIP_PHYS_ADDR));
++	entry = (phys_addr_t)(&secondary_startup)
++		- XIP_VIRT_ADDR(CONFIG_XIP_PHYS_ADDR)
++		+ CONFIG_XIP_PHYS_ADDR;
+ #else
+-		return psci_ops.cpu_on(cpu_logical_map(cpu),
+-					virt_to_idmap(&secondary_startup));
++	entry = virt_to_idmap(&secondary_startup);
+ #endif
+-	return -ENODEV;
++
++	ret = psci_ops.cpu_on(cpu_logical_map(cpu), entry);
++
++	/*
++	 * Downstream diagnostic. On this board CPU_ON is accepted by the
++	 * firmware but CPU1 never comes online, and the generic path discards
++	 * the return value, so there is no way to tell a rejected call from a
++	 * secondary that starts and then hangs. Log both the arguments and the
++	 * PSCI return code.
++	 */
++	pr_info("psci: CPU%u cpu_on(mpidr=0x%lx, entry=%pa) returned %d\n",
++		cpu, cpu_logical_map(cpu), &entry, ret);
++
++	return ret;
+ }
+ 
+ #ifdef CONFIG_HOTPLUG_CPU

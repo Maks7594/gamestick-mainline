@@ -1,0 +1,15 @@
+diff --git a/Makefile b/Makefile
+index 23d6c90..56f10b7 100755
+--- a/Makefile
++++ b/Makefile
+@@ -363,6 +363,10 @@ endif
+ 
+ ifneq ($(KERNELRELEASE),)
+ 
++# Linux 6.18 no longer propagates this legacy external-module variable.
++# Retain the vendor feature selection above through the supported Kbuild API.
++ccflags-y += $(EXTRA_CFLAGS)
++
+ rtk_core :=	rtw_cmd.o \
+ 		rtw_security.o \
+ 		rtw_debug.o \

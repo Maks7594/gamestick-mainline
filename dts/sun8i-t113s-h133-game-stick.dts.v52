@@ -1,0 +1,208 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Minimal bring-up device tree for an unidentified H133/T113-S3 HDMI stick.
+ *
+ * The board manufacturer and model are not printed on the PCB, so the
+ * compatible intentionally uses only the upstream SoC fallback.  Add a real
+ * board compatible when the hardware can be identified.
+ */
+
+/dts-v1/;
+
+#include "sun8i-t113s.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	model = "H133 HDMI Game Stick (board vendor unknown)";
+	compatible = "allwinner,sun8i-t113s";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		/*
+		 * Required for the framebuffer child below to produce a memory
+		 * resource. Without them the kernel reports:
+		 *
+		 *   simple-framebuffer chosen:framebuffer@4bee8c00: No memory resource
+		 *   ... probe with driver simple-framebuffer failed with error -22
+		 *
+		 * of_translate_one() bails with "no ranges; cannot translate" when the
+		 * parent has no ranges property, so reg never becomes a resource. An
+		 * empty "ranges" gives the 1:1 translation this node needs. Every
+		 * in-tree DT that puts simple-framebuffer under /chosen declares all
+		 * three.
+		 */
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		stdout-path = "serial0:115200n8";
+		/* Ignored while CONFIG_CMDLINE_FORCE=y; kept in sync to avoid confusion. */
+		bootargs = "console=ttyS0,115200 console=tty0 earlycon clk_ignore_unused pd_ignore_unused rdinit=/init loglevel=8 ignore_loglevel panic=0";
+
+		/*
+		 * Take over the framebuffer U-Boot already set up. Must be a direct
+		 * child of /chosen: drivers/of/platform.c finds it with
+		 * of_get_compatible_child(of_chosen, "simple-framebuffer").
+		 *
+		 * Geometry from the running vendor system:
+		 *   disp_reserve=3686400,0x4bee8c00
+		 *   boot_fb0 = "4bee8c00,500,2d0,20,1400"
+		 * 0x500=1280 wide, 0x2d0=720 high, 0x20=32bpp, 0x1400=5120 stride,
+		 * and 0x384000 == 3686400 == 1280*720*4.
+		 */
+		/*
+		 * Base is disp_reserve's 0x4bee8c00 + 0x40.
+		 *
+		 * With the plain 0x4bee8c00 every console line was rotated left by
+		 * exactly 2 characters, the leading pair reappearing at the right
+		 * edge. 2 chars * 8 px * 4 bytes = 64 bytes, and the shift was
+		 * identical on every line - a wrong stride would instead shear
+		 * progressively down the screen, and v41's chunk test already
+		 * confirmed stride 5120 / width 1280 to well under a row.
+		 *
+		 * Screen X=0 was showing what fbcon wrote at column 2, so
+		 * T + Y*stride = F + Y*stride + 64, i.e. the real scanout base is
+		 * 64 bytes above what disp_reserve reports. If this over-corrects
+		 * (shift doubles rather than vanishes) the answer is 0x4bee8bc0.
+		 *
+		 * The reserved-memory range below still covers this: it runs to
+		 * 0x4c26d000 and this ends at 0x4c26cc40.
+		 */
+		framebuffer0: framebuffer@4bee8c40 {
+			compatible = "simple-framebuffer";
+			reg = <0x4bee8c40 0x384000>;
+			width = <1280>;
+			height = <720>;
+			stride = <5120>;
+			format = "x8r8g8b8";
+		};
+	};
+
+	/*
+	 * Keep the kernel out of the framebuffer. Without this the page allocator
+	 * hands this range out as ordinary memory and scribbles over the picture -
+	 * the green bands seen under v35.
+	 */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Page-aligned on purpose. ARM ioremap checks
+		 * memblock_is_map_memory(PFN_PHYS(pfn)) - the page holding the
+		 * address, 0x4bee8000. Reserving from the unaligned 0x4bee8c00 left
+		 * 0x4bee8000-0x4bee8c00 mapped as ordinary RAM, so the check failed
+		 * and ioremap_wc() returned NULL for the whole framebuffer.
+		 *
+		 * 0x4bee8000 + 0x385000 covers 0x4bee8c00 + 0x384000 with both ends
+		 * rounded out to page boundaries.
+		 */
+		fb_reserved: framebuffer@4bee8000 {
+			reg = <0x4bee8000 0x385000>;
+			no-map;
+		};
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x40000000 0x10000000>;
+	};
+
+	reg_vcc3v3: regulator-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	reg_usb_vbus: regulator-usb-vbus {
+		compatible = "regulator-fixed";
+		regulator-name = "usb-vbus";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		regulator-always-on;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		status_led: led-0 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_STATUS;
+			gpios = <&pio 1 12 GPIO_ACTIVE_HIGH>; /* PB12 */
+			default-state = "off";
+			/*
+			 * Positive control. Without a trigger a dark LED is
+			 * ambiguous: it means either "the kernel died" or "the
+			 * LED was never asked to light". The heartbeat trigger
+			 * is the only signal proven to work on this board.
+			 */
+			linux,default-trigger = "heartbeat";
+		};
+	};
+};
+
+&dcxo {
+	clock-frequency = <24000000>;
+};
+
+&ehci0 {
+	status = "okay";
+};
+
+&ehci1 {
+	status = "okay";
+};
+
+&mmc0 {
+	pinctrl-0 = <&mmc0_pins>;
+	pinctrl-names = "default";
+	vmmc-supply = <&reg_vcc3v3>;
+	/*
+	 * This card is the boot medium.  Treat it as permanently present during
+	 * early bring-up so an uncertain PF6 card-detect polarity cannot prevent
+	 * the kernel from ever registering the root block device.
+	 */
+	non-removable;
+	disable-wp;
+	bus-width = <4>;
+	status = "okay";
+};
+
+&ohci0 {
+	status = "okay";
+};
+
+&ohci1 {
+	status = "okay";
+};
+
+&pio {
+	vcc-pb-supply = <&reg_vcc3v3>;
+	vcc-pf-supply = <&reg_vcc3v3>;
+
+	uart0_pb8_pins: uart0-pb8-pins {
+		pins = "PB8", "PB9";
+		function = "uart0";
+		bias-pull-up;
+	};
+};
+
+&uart0 {
+	pinctrl-0 = <&uart0_pb8_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&usbphy {
+	usb0_vbus-supply = <&reg_usb_vbus>;
+	usb1_vbus-supply = <&reg_usb_vbus>;
+	status = "okay";
+};

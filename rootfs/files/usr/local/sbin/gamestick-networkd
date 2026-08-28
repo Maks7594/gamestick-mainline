@@ -1,0 +1,192 @@
+#!/bin/sh
+set -u
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+config=/etc/gamestick/network.conf
+[ -r "$config" ] && . "$config"
+WIFI_BACKEND=${WIFI_BACKEND:-wpa_supplicant}
+WPA_CONF=${WPA_CONF:-/etc/wpa_supplicant/wpa_supplicant.conf}
+WIFI_MODULE=${WIFI_MODULE:-8188eu}
+RETRY_DELAY=${RETRY_DELAY:-5}
+ASSOC_TIMEOUT=${ASSOC_TIMEOUT:-45}
+DHCP_TRIES=${DHCP_TRIES:-8}
+export WPA_CONF
+
+log_file=/var/log/gamestick-network.log
+ready_file=/run/gamestick-network.ready
+backend="/usr/local/libexec/gamestick/wifi-backend-$WIFI_BACKEND"
+
+mkdir -p /var/log /run
+touch "$log_file"
+chmod 0600 "$log_file"
+
+rotate_log() {
+	size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+	if [ "$size" -gt 1048576 ]; then
+		mv -f "$log_file" "$log_file.old"
+		: > "$log_file"
+		chmod 0600 "$log_file"
+	fi
+}
+
+log() {
+	rotate_log
+	stamp=$(date '+%Y-%m-%dT%H:%M:%S%z')
+	printf '%s %s\n' "$stamp" "$*" | tee -a "$log_file" >&2
+}
+
+set_led() {
+	mode=$1
+	led=
+	for candidate in /sys/class/leds/*; do
+		[ -d "$candidate" ] || continue
+		led=$candidate
+		break
+	done
+	[ -n "$led" ] || return 0
+	case "$mode" in
+		boot)
+			echo timer > "$led/trigger" 2>/dev/null || true
+			echo 250 > "$led/delay_on" 2>/dev/null || true
+			echo 250 > "$led/delay_off" 2>/dev/null || true
+			;;
+		ready)
+			echo none > "$led/trigger" 2>/dev/null || true
+			echo 1 > "$led/brightness" 2>/dev/null || true
+			;;
+	esac
+}
+
+usb_snapshot() {
+	log "USB snapshot begin"
+	for dev in /sys/bus/usb/devices/*; do
+		[ -r "$dev/idVendor" ] && [ -r "$dev/idProduct" ] || continue
+		vendor=$(cat "$dev/idVendor")
+		product=$(cat "$dev/idProduct")
+		name=$(cat "$dev/product" 2>/dev/null || echo unknown)
+		log "USB $(basename "$dev") $vendor:$product $name"
+	done
+	log "USB snapshot end"
+}
+
+has_ipv4() {
+	ip -4 addr show dev "$1" 2>/dev/null | grep -q 'inet '
+}
+
+wireless_interfaces() {
+	for path in /sys/class/net/*; do
+		[ -d "$path/wireless" ] || continue
+		basename "$path"
+	done
+}
+
+is_wireless() {
+	[ -d "/sys/class/net/$1/wireless" ]
+}
+
+wired_interfaces() {
+	for path in /sys/class/net/*; do
+		iface=$(basename "$path")
+		[ "$iface" != lo ] || continue
+		[ ! -d "$path/wireless" ] || continue
+		[ "$(cat "$path/type" 2>/dev/null)" = 1 ] || continue
+		echo "$iface"
+	done
+}
+
+dhcp() {
+	iface=$1
+	pidfile="/run/udhcpc-$iface.pid"
+	rm -f "$pidfile"
+	log "DHCP requesting a lease on $iface"
+	if udhcpc -f -q -n -i "$iface" -p "$pidfile" \
+		-t "$DHCP_TRIES" -T 3 -s /usr/share/udhcpc/default.script \
+		>> "$log_file" 2>&1; then
+		if has_ipv4 "$iface"; then
+			log "DHCP succeeded on $iface: $(ip -4 -o addr show dev "$iface" 2>/dev/null)"
+			return 0
+		fi
+	fi
+	log "DHCP failed on $iface"
+	return 1
+}
+
+try_ethernet() {
+	for iface in $(wired_interfaces); do
+		ip link set "$iface" up 2>> "$log_file" || true
+		carrier=$(cat "/sys/class/net/$iface/carrier" 2>/dev/null || echo 0)
+		log "Ethernet candidate $iface carrier=$carrier"
+		[ "$carrier" = 1 ] || continue
+		has_ipv4 "$iface" && { echo "$iface"; return 0; }
+		dhcp "$iface" && { echo "$iface"; return 0; }
+	done
+	return 1
+}
+
+try_wifi() {
+	[ -x "$backend" ] || { log "Wi-Fi backend is missing: $backend"; return 1; }
+	for iface in $(wireless_interfaces); do
+		log "Wireless candidate detected: $iface (backend=$WIFI_BACKEND)"
+		"$backend" start "$iface" >> "$log_file" 2>&1 || {
+			log "Failed to start $WIFI_BACKEND on $iface"
+			continue
+		}
+		elapsed=0
+		while [ "$elapsed" -lt "$ASSOC_TIMEOUT" ]; do
+			state=$("$backend" status "$iface" 2>/dev/null | sed -n 's/^wpa_state=//p')
+			[ "$state" = COMPLETED ] && break
+			[ $((elapsed % 10)) -eq 0 ] && log "Waiting for association on $iface (state=${state:-unknown})"
+			sleep 2
+			elapsed=$((elapsed + 2))
+		done
+		state=$("$backend" status "$iface" 2>/dev/null | sed -n 's/^wpa_state=//p')
+		if [ "$state" != COMPLETED ]; then
+			log "Association timed out on $iface (state=${state:-unknown})"
+			"$backend" stop "$iface" >> "$log_file" 2>&1 || true
+			continue
+		fi
+		log "Wi-Fi associated on $iface"
+		dhcp "$iface" && { echo "$iface"; return 0; }
+		"$backend" stop "$iface" >> "$log_file" 2>&1 || true
+	done
+	return 1
+}
+
+set_led boot
+rm -f "$ready_file"
+log "Recovery network daemon starting"
+attempt=0
+
+while :; do
+	attempt=$((attempt + 1))
+	if [ "$attempt" -eq 1 ] || [ $((attempt % 12)) -eq 0 ]; then
+		usb_snapshot
+	fi
+
+	log "Loading cfg80211 and $WIFI_MODULE (attempt $attempt)"
+	modprobe cfg80211 >> "$log_file" 2>&1 || log "modprobe cfg80211 failed"
+	modprobe "$WIFI_MODULE" >> "$log_file" 2>&1 || log "modprobe $WIFI_MODULE failed (adapter may be late)"
+
+	iface=
+	iface=$(try_ethernet) || true
+	[ -n "$iface" ] || { iface=$(try_wifi) || true; }
+
+	if [ -n "$iface" ] && has_ipv4 "$iface"; then
+		printf '%s\n' "$iface" > "$ready_file"
+		log "Network ready on $iface"
+		while has_ipv4 "$iface"; do
+			sleep 10
+		done
+		log "Address disappeared from $iface; returning to recovery loop"
+		rm -f "$ready_file"
+		set_led boot
+		if is_wireless "$iface"; then
+			"$backend" stop "$iface" >> "$log_file" 2>&1 || true
+		fi
+	fi
+
+	log "No usable network; retrying in ${RETRY_DELAY}s"
+	sleep "$RETRY_DELAY"
+done

@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+
+name="Game Stick recovery SSH"
+description="Wait for an address and keep Dropbear running"
+command=/usr/local/sbin/gamestick-dropbeard
+supervisor=supervise-daemon
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	need gamestick-network
+	after localmount
+}

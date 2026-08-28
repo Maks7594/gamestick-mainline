@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+
+name="Game Stick recovery networking"
+description="Continuously discover USB networking, associate Wi-Fi, and run DHCP"
+command=/usr/local/sbin/gamestick-networkd
+supervisor=supervise-daemon
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	need localmount
+	after modules
+	before gamestick-dropbear
+}

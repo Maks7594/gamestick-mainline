@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+
+action=${1:-}
+iface=${2:-}
+[ -n "$iface" ] || { echo "wireless interface is required" >&2; exit 2; }
+conf=${WPA_CONF:-/etc/wpa_supplicant/wpa_supplicant.conf}
+pidfile="/run/wpa_supplicant-$iface.pid"
+ctrl="/run/wpa_supplicant"
+
+case "$action" in
+	start)
+		[ -s "$conf" ] || { echo "missing Wi-Fi config: $conf" >&2; exit 1; }
+		mkdir -p "$ctrl"
+		if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+			exit 0
+		fi
+		rm -f "$pidfile"
+		ip link set "$iface" up
+		exec wpa_supplicant -B -P "$pidfile" -D nl80211 -i "$iface" -c "$conf"
+		;;
+	stop)
+		if [ -s "$pidfile" ]; then
+			pid=$(cat "$pidfile")
+			kill "$pid" 2>/dev/null || true
+			count=0
+			while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 10 ]; do
+				sleep 1
+				count=$((count + 1))
+			done
+		fi
+		rm -f "$pidfile"
+		;;
+	status)
+		wpa_cli -p "$ctrl" -i "$iface" status 2>/dev/null
+		;;
+	*)
+		echo "Usage: $0 {start|stop|status} INTERFACE" >&2
+		exit 2
+		;;
+esac

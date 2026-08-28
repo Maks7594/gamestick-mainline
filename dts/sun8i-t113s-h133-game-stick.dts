@@ -1,0 +1,447 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Minimal bring-up device tree for an unidentified H133/T113-S3 HDMI stick.
+ *
+ * The board manufacturer and model are not printed on the PCB, so the
+ * compatible intentionally uses only the upstream SoC fallback.  Add a real
+ * board compatible when the hardware can be identified.
+ */
+
+/dts-v1/;
+
+#include "sun8i-t113s.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	model = "H133 HDMI Game Stick (board vendor unknown)";
+	compatible = "allwinner,sun8i-t113s";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		/*
+		 * Required for the framebuffer child below to produce a memory
+		 * resource. Without them the kernel reports:
+		 *
+		 *   simple-framebuffer chosen:framebuffer@4bee8c00: No memory resource
+		 *   ... probe with driver simple-framebuffer failed with error -22
+		 *
+		 * of_translate_one() bails with "no ranges; cannot translate" when the
+		 * parent has no ranges property, so reg never becomes a resource. An
+		 * empty "ranges" gives the 1:1 translation this node needs. Every
+		 * in-tree DT that puts simple-framebuffer under /chosen declares all
+		 * three.
+		 */
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		stdout-path = "serial0:115200n8";
+		/* Ignored while CONFIG_CMDLINE_FORCE=y; kept in sync to avoid confusion. */
+		bootargs = "console=ttyS0,115200 console=tty0 earlycon clk_ignore_unused pd_ignore_unused rdinit=/init loglevel=8 ignore_loglevel panic=0";
+
+		/*
+		 * Take over the framebuffer U-Boot already set up. Must be a direct
+		 * child of /chosen: drivers/of/platform.c finds it with
+		 * of_get_compatible_child(of_chosen, "simple-framebuffer").
+		 *
+		 * Geometry from the running vendor system:
+		 *   disp_reserve=3686400,0x4bee8c00
+		 *   boot_fb0 = "4bee8c00,500,2d0,20,1400"
+		 * 0x500=1280 wide, 0x2d0=720 high, 0x20=32bpp, 0x1400=5120 stride,
+		 * and 0x384000 == 3686400 == 1280*720*4.
+		 */
+		/*
+		 * Base is disp_reserve's 0x4bee8c00 + 0x40.
+		 *
+		 * With the plain 0x4bee8c00 every console line was rotated left by
+		 * exactly 2 characters, the leading pair reappearing at the right
+		 * edge. 2 chars * 8 px * 4 bytes = 64 bytes, and the shift was
+		 * identical on every line - a wrong stride would instead shear
+		 * progressively down the screen, and v41's chunk test already
+		 * confirmed stride 5120 / width 1280 to well under a row.
+		 *
+		 * Screen X=0 was showing what fbcon wrote at column 2, so
+		 * T + Y*stride = F + Y*stride + 64, i.e. the real scanout base is
+		 * 64 bytes above what disp_reserve reports. If this over-corrects
+		 * (shift doubles rather than vanishes) the answer is 0x4bee8bc0.
+		 *
+		 * The reserved-memory range below still covers this: it runs to
+		 * 0x4c26d000 and this ends at 0x4c26cc40.
+		 */
+		framebuffer0: framebuffer@4bee8c40 {
+			compatible = "simple-framebuffer";
+			reg = <0x4bee8c40 0x384000>;
+			width = <1280>;
+			height = <720>;
+			stride = <5120>;
+			format = "x8r8g8b8";
+		};
+	};
+
+	/*
+	 * Keep the kernel out of the framebuffer. Without this the page allocator
+	 * hands this range out as ordinary memory and scribbles over the picture -
+	 * the green bands seen under v35.
+	 */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Page-aligned on purpose. ARM ioremap checks
+		 * memblock_is_map_memory(PFN_PHYS(pfn)) - the page holding the
+		 * address, 0x4bee8000. Reserving from the unaligned 0x4bee8c00 left
+		 * 0x4bee8000-0x4bee8c00 mapped as ordinary RAM, so the check failed
+		 * and ioremap_wc() returned NULL for the whole framebuffer.
+		 *
+		 * 0x4bee8000 + 0x385000 covers 0x4bee8c00 + 0x384000 with both ends
+		 * rounded out to page boundaries.
+		 */
+		fb_reserved: framebuffer@4bee8000 {
+			reg = <0x4bee8000 0x385000>;
+			no-map;
+		};
+
+		/*
+		 * Crash log store. This board has no reachable UART, so a hang
+		 * or panic takes its own evidence with it - which is how v60's
+		 * SMP instability had to be debugged blind. ramoops keeps the
+		 * kernel log in RAM across a reboot, readable afterwards from
+		 * /sys/fs/pstore.
+		 *
+		 * Placed immediately above the framebuffer reservation, which
+		 * ends at 0x4c26d000. The first attempt used 0x4fe00000 and
+		 * recorded nothing, which was blamed on U-Boot relocating to
+		 * the top of DRAM - wrong. That address was fine; the reads
+		 * failed because the board was power-cycled, which loses DRAM.
+		 * Note also that a warm reset only sometimes preserves memory
+		 * here: boot0 re-runs DRAM init and the result is a coin flip.
+		 *
+		 * Deliberately NOT no-map: ramoops memremaps this region and
+		 * needs it mappable.
+		 *
+		 * Reboot goes through the watchdog, which resets the SoC without
+		 * clearing DRAM, so the contents survive.
+		 */
+		ramoops@4c280000 {
+			compatible = "ramoops";
+			reg = <0x4c280000 0x100000>;
+			record-size = <0x8000>;
+			console-size = <0x40000>;
+			pmsg-size = <0x8000>;
+		};
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x40000000 0x10000000>;
+	};
+
+	reg_vcc3v3: regulator-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	reg_usb_vbus: regulator-usb-vbus {
+		compatible = "regulator-fixed";
+		regulator-name = "usb-vbus";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		regulator-always-on;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		status_led: led-0 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_STATUS;
+			gpios = <&pio 1 12 GPIO_ACTIVE_HIGH>; /* PB12 */
+			default-state = "off";
+			/*
+			 * Positive control. Without a trigger a dark LED is
+			 * ambiguous: it means either "the kernel died" or "the
+			 * LED was never asked to light". The heartbeat trigger
+			 * is the only signal proven to work on this board.
+			 */
+			/* Disk activity. The trigger is named for the host: mmc0. */
+			linux,default-trigger = "mmc0";
+		};
+	};
+};
+
+&dcxo {
+	clock-frequency = <24000000>;
+};
+
+&ehci0 {
+	status = "okay";
+};
+
+&ehci1 {
+	status = "okay";
+};
+
+&mmc0 {
+	pinctrl-0 = <&mmc0_pins>;
+	pinctrl-names = "default";
+	vmmc-supply = <&reg_vcc3v3>;
+	/*
+	 * This card is the boot medium.  Treat it as permanently present during
+	 * early bring-up so an uncertain PF6 card-detect polarity cannot prevent
+	 * the kernel from ever registering the root block device.
+	 */
+	non-removable;
+	disable-wp;
+	bus-width = <4>;
+	status = "okay";
+};
+
+&ohci0 {
+	status = "okay";
+};
+
+&ohci1 {
+	status = "okay";
+};
+
+&pio {
+	vcc-pb-supply = <&reg_vcc3v3>;
+	vcc-pf-supply = <&reg_vcc3v3>;
+
+	uart0_pb8_pins: uart0-pb8-pins {
+		pins = "PB8", "PB9";
+		function = "uart0";
+		bias-pull-up;
+	};
+};
+
+&uart0 {
+	pinctrl-0 = <&uart0_pb8_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&usbphy {
+	usb0_vbus-supply = <&reg_usb_vbus>;
+	usb1_vbus-supply = <&reg_usb_vbus>;
+	status = "okay";
+};
+
+/*
+ * Display pipeline.
+ *
+ * mainline already has everything from the mixers to the TCONs, and the CCU
+ * driver already provides the HDMI clocks and resets. The pipeline is wired
+ * mixer0 -> tcon_top -> tcon_tv0 -> tcon_top_hdmi_out, where it stops: the
+ * upstream DTSI leaves port@5 dangling because there is no HDMI controller
+ * node. The nodes below close that gap.
+ *
+ * Register addresses, the interrupt and the clock/reset wiring are cross
+ * checked against the vendor DT: it has hdmi@5500000 with interrupt 0x5d
+ * (93), which is what SOC_PERIPHERAL_IRQ(93) resolves to here.
+ */
+&de {
+	status = "okay";
+};
+
+&tcon_top_hdmi_out {
+	tcon_top_hdmi_out_hdmi: endpoint {
+		remote-endpoint = <&hdmi_in_tcon_top>;
+	};
+};
+
+/*
+ * The upstream soc node carries no label, so it has to be reopened by
+ * path rather than with an &soc reference.
+ */
+/ {
+	soc {
+		hdmi: hdmi@5500000 {
+			compatible = "allwinner,sun20i-d1-dw-hdmi";
+			reg = <0x5500000 0x10000>;
+			reg-io-width = <1>;
+			interrupts = <SOC_PERIPHERAL_IRQ(93) IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ccu CLK_BUS_HDMI>,
+				 <&ccu CLK_HDMI_24M>,
+				 <&ccu CLK_HDMI_CEC>;
+			/*
+			 * No "tmds" clock: unlike the A83T and H6, this PHY generates
+			 * the TMDS clock from its own PLL. sun8i_dw_hdmi.c asks for it
+			 * with devm_clk_get_optional() for exactly this reason.
+			 */
+			clock-names = "iahb", "isfr", "cec";
+			resets = <&ccu RST_BUS_HDMI_SUB>;
+			reset-names = "ctrl";
+			phys = <&hdmi_phy>;
+			phy-names = "phy";
+			#sound-dai-cells = <0>;
+			status = "okay";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					hdmi_in_tcon_top: endpoint {
+						remote-endpoint = <&tcon_top_hdmi_out_hdmi>;
+					};
+				};
+
+				hdmi_out: port@1 {
+					reg = <1>;
+				};
+			};
+		};
+
+		hdmi_phy: phy@5510000 {
+			compatible = "allwinner,sun20i-d1-hdmi-phy";
+			reg = <0x5510000 0x10000>;
+			clocks = <&ccu CLK_BUS_HDMI>, <&ccu CLK_HDMI_24M>;
+			clock-names = "bus", "mod";
+			resets = <&ccu RST_BUS_HDMI_MAIN>;
+			reset-names = "phy";
+			status = "okay";
+			#phy-cells = <0>;
+		};
+	};
+};
+
+/*
+ * HDMI audio.
+ *
+ * The vendor DT routes audio the same way: i2s2@2034000 with
+ * dai-type = "hdmi" feeding an "allwinner,sunxi-snd-codec-hdmi" node. Mainline
+ * already has the controller - i2s2 is in the upstream DTSI, and sun4i-i2s
+ * claims it through the "allwinner,sun50i-r329-i2s" fallback - so all that is
+ * needed is to enable it and link it to the codec dw-hdmi exposes.
+ *
+ * The analog codec at 0x2030000 is deliberately left alone: the vendor DT has
+ * it status = "disabled", so nothing is wired to those pins on this board.
+ */
+&i2s2 {
+	/*
+	 * Route TX into the internal audio hub rather than out to the I2S
+	 * pins, which are not connected on this board. This is what actually
+	 * carries the samples to the HDMI controller - without it playback
+	 * runs cleanly and is silent. Mirrors the vendor DT's tx-hub-en on
+	 * the same node.
+	 */
+	allwinner,tx-hub-en;
+	status = "okay";
+};
+
+/ {
+	hdmi_sound: hdmi-sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "H133-HDMI";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,frame-master = <&hdmi_sound_cpu>;
+		simple-audio-card,bitclock-master = <&hdmi_sound_cpu>;
+
+		hdmi_sound_cpu: simple-audio-card,cpu {
+			sound-dai = <&i2s2>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&hdmi>;
+		};
+	};
+};
+
+/*
+ * Reboot.
+ *
+ * Both watchdog nodes are status = "reserved" in the upstream DTSI, so
+ * of_device_is_available() rejects them and sunxi-wdt never binds. Without it
+ * no restart handler is registered at all, and since this SoC has no PSCI
+ * firmware either, "reboot" has nothing to reset the machine with and simply
+ * halts - which is what was happening, despite CONFIG_SUNXI_WATCHDOG=y.
+ *
+ * This is the 0x20500a0 node, whose "-reset" compatible is the one that can
+ * reset the whole SoC. sunxi_wdt matches on the second string and registers a
+ * restart handler at priority 128. It does not arm the watchdog: nothing runs
+ * unless userspace opens /dev/watchdog, and no watchdog daemon is installed.
+ */
+&wdt {
+	status = "okay";
+};
+
+/*
+ * Second CPU core.
+ *
+ * The upstream sun8i-t113s.dtsi declares cpu@0 and cpu@1 but gives neither an
+ * enable-method, so the kernel has no way to start the secondary core and
+ * quietly runs on one: "smp: Brought up 1 node, 1 CPU". CONFIG_SMP=y is not
+ * sufficient on its own.
+ *
+ * The vendor DT uses PSCI for this - cpus { enable-method =
+ * "allwinner,sun8iw20p1"; } with enable-method = "psci" on each core, plus a
+ * psci node with method = "smc". We boot through the same vendor firmware
+ * chain, so those PSCI services should still be installed.
+ *
+ * If the firmware turns out not to provide PSCI, the SMC will fault or hang
+ * during SMP bring-up - restore artifacts/boot-audiohub-v57.img.
+ */
+/ {
+	psci {
+		compatible = "arm,psci-1.0";
+		method = "smc";
+	};
+};
+
+&cpu0 {
+	enable-method = "psci";
+};
+
+&cpu1 {
+	enable-method = "psci";
+};
+
+/*
+ * The vendor firmware leaves CNTVOFF uninitialised on the secondary core, so
+ * the two CPUs disagree about the time by a fixed ~7481 seconds. Caught by
+ * running the softlockup detector with both cores up: consecutive kernel log
+ * lines read
+ *
+ *   [    3.069790] devtmpfs: mounted
+ *   [ 7484.437214] Freeing unused kernel image (initmem) memory: 1024K
+ *
+ * The jump lands exactly where CPU1 comes online, and every later message from
+ * CPU1 carries the same offset:
+ *
+ *   watchdog: BUG: soft lockup - CPU#1 stuck for 21s! [swapper/1:0]
+ *
+ * Linux reads the virtual counter, CNTVCT = CNTPCT - CNTVOFF, so a garbage
+ * CNTVOFF on one core corrupts ktime_get() depending on which CPU calls it.
+ * That is what made SMP look "unstable" from v60 onwards.
+ *
+ * CNTVOFF is only writable from HYP mode. secondary_startup does call
+ * __hyp_stub_install_secondary, which zeroes it, but this firmware enters
+ * Linux in SVC so that fix never runs.
+ *
+ * Tell the timer driver not to trust the firmware. On ARM that switches it to
+ * the physical counter, which has no per-core offset. sun6i-a31, sun8i-a23-a33
+ * and sun9i-a80 all carry the same property for the same reason.
+ *
+ * clock-frequency matches &dcxo; the property means CNTFRQ cannot be trusted
+ * either. The node has no label upstream, hence the path form.
+ */
+/ {
+	timer {
+		arm,cpu-registers-not-fw-configured;
+		clock-frequency = <24000000>;
+	};
+};

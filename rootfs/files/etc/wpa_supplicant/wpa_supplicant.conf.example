@@ -1,0 +1,9 @@
+ctrl_interface=/run/wpa_supplicant
+update_config=0
+country=PL
+
+network={
+	ssid="replace-me"
+	psk="replace-me"
+	key_mgmt=WPA-PSK
+}

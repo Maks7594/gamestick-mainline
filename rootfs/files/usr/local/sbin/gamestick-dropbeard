@@ -1,0 +1,68 @@
+#!/bin/sh
+set -u
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+[ -r /etc/gamestick/dropbear.conf ] && . /etc/gamestick/dropbear.conf
+DROPBEAR_PORT=${DROPBEAR_PORT:-22}
+DROPBEAR_PASSWORD_AUTH=${DROPBEAR_PASSWORD_AUTH:-yes}
+log_file=/var/log/gamestick-dropbear.log
+ready_file=/run/gamestick-network.ready
+key_dir=/etc/dropbear
+
+mkdir -p /var/log "$key_dir"
+touch "$log_file"
+chmod 0600 "$log_file"
+
+log() {
+	stamp=$(date '+%Y-%m-%dT%H:%M:%S%z')
+	printf '%s %s\n' "$stamp" "$*" | tee -a "$log_file" >&2
+}
+
+has_ipv4() {
+	iface=$1
+	[ -n "$iface" ] && ip -4 addr show dev "$iface" 2>/dev/null | grep -q 'inet '
+}
+
+set_ready_led() {
+	for led in /sys/class/leds/*; do
+		[ -d "$led" ] || continue
+		echo none > "$led/trigger" 2>/dev/null || true
+		echo 1 > "$led/brightness" 2>/dev/null || true
+		break
+	done
+}
+
+generate_key() {
+	type=$1
+	file=$2
+	[ -s "$file" ] && return 0
+	log "Generating Dropbear $type host key"
+	dropbearkey -t "$type" -f "$file" >> "$log_file" 2>&1
+	chmod 0600 "$file"
+}
+
+generate_key ed25519 "$key_dir/dropbear_ed25519_host_key"
+generate_key rsa "$key_dir/dropbear_rsa_host_key"
+
+while :; do
+	while [ ! -s "$ready_file" ]; do sleep 2; done
+	iface=$(cat "$ready_file" 2>/dev/null || true)
+	if ! has_ipv4 "$iface"; then
+		sleep 2
+		continue
+	fi
+
+	password_flag=
+	[ "$DROPBEAR_PASSWORD_AUTH" = yes ] || password_flag=-s
+	log "Starting Dropbear on port $DROPBEAR_PORT via $iface"
+	set_ready_led
+	# -F keeps it in the foreground; this loop and OpenRC supervision both
+	# ensure an unexpected exit cannot leave the device inaccessible.
+	/usr/sbin/dropbear -F -E $password_flag -b /etc/banner -p "$DROPBEAR_PORT" \
+		-r "$key_dir/dropbear_ed25519_host_key" \
+		-r "$key_dir/dropbear_rsa_host_key" >> "$log_file" 2>&1
+	status=$?
+	log "Dropbear exited with status $status; restarting in 3s"
+	sleep 3
+done
